@@ -1,7 +1,7 @@
 
 import re
 from datetime import date
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
 app = FastAPI()
@@ -23,65 +23,69 @@ def extract(req: InvoiceRequest):
     text = req.text.strip()
 
     if not text:
-        from fastapi import HTTPException
-        raise HTTPException(status_code=422, detail="Empty text")
+        raise HTTPException(422, "Empty invoice text")
 
-    vendor_match = re.search(
-        r"(?:invoice\s+from|vendor\s*[:\-])\s*"
-        r"([A-Za-z0-9][A-Za-z0-9 &.,'-]*?)"
-        r"(?=\s+(?:total|amount|currency|invoice\s+date|due\s+date|payment\s+due)\b|[,;\n]|$)",
+    # Extract vendor name
+    vendor = None
+    vendor_patterns = [
+        r"(?:vendor|supplier|billed\s+by|invoice\s+from)"
+        r"\s*[:\-]?\s*([A-Za-z0-9][A-Za-z0-9 &.,'-]{1,100}?)"
+        r"(?=\s+(?:invoice|total|amount|currency|date|payment|due)\b|[\n;]|$)",
+
+        r"\b([A-Z][A-Za-z0-9&.,' -]{1,70}?"
+        r"(?:Industries|Corporation|Company|Limited|Ltd\.?|LLC|Inc\.?))\b"
+    ]
+
+    for pattern in vendor_patterns:
+        match = re.search(pattern, text, re.I)
+        if match:
+            vendor = match.group(1).strip(" ,.-")
+            break
+
+    # Extract currency
+    currency_match = re.search(r"\b(USD|EUR|GBP)\b", text, re.I)
+    currency = currency_match.group(1).upper() if currency_match else None
+
+    # Extract amount, preferring total-due labels
+    amount = None
+    amount_pattern = r"(?<![\w.])(?:\d{1,3}(?:,\d{3})+|\d+)(?:\.\d{1,2})?(?!\w)"
+
+    labels = [
+        r"(?:total\s+amount\s+due|total\s+due|amount\s+due|grand\s+total|total\s+payable|amount\s+payable|invoice\s+total|total)"
+        r"\s*[:=\-]?\s*(?:(?:USD|EUR|GBP)\s*)?(" + amount_pattern + r")",
+
+        r"(?:USD|EUR|GBP)\s*(" + amount_pattern + r")"
+    ]
+
+    for pattern in labels:
+        matches = list(re.finditer(pattern, text, re.I))
+        if matches:
+            amount = float(matches[-1].group(1).replace(",", ""))
+            break
+
+    # Extract the due date
+    date_match = re.search(
+        r"(?:payment\s+due\s+date|due\s+date|payable\s+by|payment\s+due|due\s+on)"
+        r"\s*[:=\-]?\s*(2026-\d{2}-\d{2})",
         text, re.I
     )
 
-    amount_match = re.search(
-        r"(?:total\s+due|amount\s+due|grand\s+total|total|amount)"
-        r"\s*[:\-]?\s*(?:(USD|EUR|GBP)\s*)?"
-        r"([0-9,]+(?:\.[0-9]{1,2})?)",
-        text, re.I
-    )
+    if not date_match:
+        date_match = re.search(r"\b(2026-\d{2}-\d{2})\b", text)
 
-    if amount_match:
-        amount = float(amount_match.group(2).replace(",", ""))
-        currency = amount_match.group(1)
-        if not currency:
-            currency_match = re.search(r"\b(USD|EUR|GBP)\b", text, re.I)
-            currency = currency_match.group(1) if currency_match else None
-    else:
-        currency_amount = re.search(
-            r"\b(USD|EUR|GBP)\s*([0-9,]+(?:\.[0-9]{1,2})?)\b",
-            text, re.I
-        )
-        if not currency_amount:
-            from fastapi import HTTPException
-            raise HTTPException(422, detail="Amount not found")
-        currency = currency_amount.group(1)
-        amount = float(currency_amount.group(2).replace(",", ""))
+    if not all([vendor, amount is not None, currency, date_match]):
+        raise HTTPException(422, "Could not identify all invoice fields")
 
-    due_date_match = re.search(
-        r"(?:payment\s+due\s+date|due\s+date|payable\s+by|payment\s+due)"
-        r"\s*[:\-]?\s*(\d{4}-\d{2}-\d{2})",
-        text, re.I
-    )
-
-    if not due_date_match:
-        due_date_match = re.search(r"\b(2026-\d{2}-\d{2})\b", text)
-
-    if not vendor_match or not due_date_match or not currency:
-        from fastapi import HTTPException
-        raise HTTPException(422, detail="Required invoice field not found")
-
-    vendor = vendor_match.group(1).strip(" ,.-")
-    due_date = due_date_match.group(1)
+    due_date = date_match.group(1)
 
     try:
         date.fromisoformat(due_date)
     except ValueError:
-        from fastapi import HTTPException
-        raise HTTPException(422, detail="Invalid date")
+        raise HTTPException(422, "Invalid invoice date")
 
     return InvoiceResponse(
         vendor=vendor,
         amount=amount,
-        currency=currency.upper(),
+        currency=currency,
         date=due_date
     )
